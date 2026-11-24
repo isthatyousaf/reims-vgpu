@@ -2230,7 +2230,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 (room + 1).min(most)
             })
-            .and_then(|most| deal(ops, self.deal_min_bytes(), self.deal_chunk_bytes(), most));
+            .and_then(|most| {
+                let (first, each) = self.deal_chunk_bytes();
+                deal(ops, self.deal_min_bytes(), first, each, most)
+            });
         let walked = match cuts {
             Some(cuts) => self.walk_dealt(
                 ops,
@@ -4419,26 +4422,43 @@ pub(super) const DEAL_MIN_BYTES: usize = 16 * 1024;
 /// costs a buffer is cut for come by the encoder (its pass ends, [`super::split`]).
 pub(super) const DEAL_MIN_ENCODERS: usize = 8;
 
-/// The op bytes of a chunk dealt to a thread, at least ([`deal`]): each chunk is a part, which
-/// the GPU runs while the walk goes on, and the last one's GPU work is left at the walk's end.
-/// WindowServer's frame in Launchpad's open view holds about 125 KiB of ops (m3-max-31226),
-/// walked in 14.8 ms on one thread (m3-max-31216; an RTX 3090 host, every driver listed,
-/// measured): so about 31 chunks of about 0.5 ms of walk each, near the 36 parts its walk on one
-/// thread cut of it (m3-max-30753, [`super::split::SPLIT_AFTER`]).
-pub(super) const DEAL_CHUNK_BYTES: usize = 4 * 1024;
+/// The op bytes of a dealt buffer's first chunk, at least ([`deal`]): the first part, which the
+/// GPU starts on while the rest is walked. Nothing of the buffer reaches the GPU before this
+/// chunk's walk ends, so it is shorter than the chunks after it ([`DEAL_CHUNK_BYTES`]).
+pub(super) const DEAL_FIRST_CHUNK_BYTES: usize = 4 * 1024;
+
+/// The op bytes of each chunk dealt to a thread after the first, at least ([`deal`]): each chunk
+/// is a part, which the GPU runs while the walk goes on, and the last one's GPU work is left at
+/// the walk's end. WindowServer's frame in Launchpad's open view holds about 125 KiB of ops
+/// (m3-max-31226), walked in 14.8 ms on one thread (m3-max-31216; an RTX 3090 host, every driver
+/// listed, measured): so about 31 chunks of about 0.5 ms of walk each, near the 36 parts its walk
+/// on one thread cut of it (m3-max-30753, [`super::split::SPLIT_AFTER`]).
+///
+/// Each part also costs the GPU its boundary, and the walk has since become far faster: on a
+/// Ryzen 7 8700F host with an RTX 5070 (NVIDIA 620.73, metal2vulkan 0c9db49765, a macOS 26.7.3
+/// guest's WindowServer animating a window of 48 layers at 240 Hz), a chunk of 4 KiB walked in
+/// about 40 µs, so the frame's two buffers dealt behind no work, of 67 and 50 KiB, went to the
+/// GPU in 14 and 11 parts. One buffer of 66 KiB and 71 passes, dealt in 13 parts where its queue
+/// was idle and in 2 behind work, kept the GPU 948 against 928 µs and spanned 1,022 against
+/// 946 µs of it at the median, about 7 µs a part. In the 67 KiB buffer each part after the first
+/// was submitted 327 µs before the GPU ended the part before it, at the median: the GPU, not the
+/// walk, was behind (REIMS_VGPU_TRACE of 2,021 frames, 2026-11-24, measured). So the chunks after
+/// the first are 16 KiB, about 160 µs of walk there, still under the 0.5 ms above.
+pub(super) const DEAL_CHUNK_BYTES: usize = 16 * 1024;
 
 /// The most chunks a command buffer is dealt in where work its queue committed before is not yet
-/// complete as its walk starts: one a thread. Its chunks are cut [`DEAL_CHUNK_BYTES`] apart so the
-/// GPU, idle, starts on the first while the rest is walked; behind earlier work the GPU is busy,
-/// and each further chunk is one more part, so one more submission to the driver and one more job
-/// of its scheduler, which the GPU waits on where it runs out of work ([`super::split`], "How many
-/// parts").
+/// complete as its walk starts: one a thread. Its chunks are cut [`DEAL_FIRST_CHUNK_BYTES`] and
+/// then [`DEAL_CHUNK_BYTES`] apart so the GPU, idle, starts on the first while the rest is
+/// walked; behind earlier work the GPU is busy, and each further chunk is one more part, so one
+/// more submission to the driver and one more job of its scheduler, which the GPU waits on where
+/// it runs out of work ([`super::split`], "How many parts").
 const DEALT_BEHIND_WORK: usize = 2;
 
 /// Where a command buffer's op stream `ops` is cut into chunks dealt to two threads at once
 /// ([`super::split`], "Two threads at once"): at the end of each encoder that another encoder
-/// follows ([`encoder_follows`]), that ends `chunk_bytes` of ops after the last cut or more (a
-/// `most`th of the stream, where that is more), into `most` chunks at most; where it holds
+/// follows ([`encoder_follows`]), that ends `first_bytes` of ops after the stream's start, for the
+/// first cut, and `chunk_bytes` after the last cut, for each later one, or more (a `most`th of
+/// the stream, where that is more), into `most` chunks at most; where it holds
 /// [`DEAL_MIN_ENCODERS`] encoders and `min_bytes` of ops at least, every one of them a render or
 /// blit encoder or an op the walk reads before it starts (`SURFACE_USE`, `SUBMITTED`,
 /// `SURFACE_ORDER`, `COMMIT_ORDER`, `GUEST_TIMES`), and none of them a pass of a rasterization
@@ -4451,11 +4471,20 @@ const DEALT_BEHIND_WORK: usize = 2;
 /// keeps it whole only where it fails from an encoder in it on ([`PartCut`]). `None` otherwise,
 /// and for a stream that does not parse, which the walk then faults at. Reads each op's header,
 /// and a render pass's flags; a stream shorter than `min_bytes` is not read.
-fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option<Vec<usize>> {
+fn deal(
+    ops: &[u8],
+    min_bytes: usize,
+    first_bytes: usize,
+    chunk_bytes: usize,
+    most: usize,
+) -> Option<Vec<usize>> {
     if ops.len() < min_bytes || most < 2 {
         return None;
     }
-    let each = chunk_bytes.max(ops.len() / most);
+    let (first, each) = (
+        first_bytes.max(ops.len() / most),
+        chunk_bytes.max(ops.len() / most),
+    );
     let (mut at, mut encoders, mut from) = (0, 0, 0);
     // Where the last encoder seen begins: a cut after it has no encoder after it.
     let mut last_begin = 0;
@@ -4477,7 +4506,8 @@ fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option
             }
             RGFX_OP_ENCODER_END => {
                 let end = at + len;
-                if end < ops.len() && end - from >= each && cuts.len() + 1 < most {
+                let least = if cuts.is_empty() { first } else { each };
+                if end < ops.len() && end - from >= least && cuts.len() + 1 < most {
                     cuts.push(end);
                     from = end;
                 }
@@ -11645,12 +11675,12 @@ mod tests {
         let at = |passes: &[usize]| Some(passes.iter().map(|n| n * pass).collect::<Vec<_>>());
         let asked = [passes(8), op(RGFX_OP_SUBMITTED, &[])].concat();
         assert_eq!(
-            deal(&asked, 0, 0, 64),
+            deal(&asked, 0, 0, 0, 64),
             at(&[1, 2, 3, 4, 5, 6, 7]),
             "no cut after the last encoder"
         );
         assert_eq!(
-            deal(&asked, 0, 0, 2),
+            deal(&asked, 0, 0, 0, 2),
             at(&[5]),
             "2 chunks, cut at the first encoder's end past half the stream"
         );
@@ -11662,7 +11692,7 @@ mod tests {
         );
         let last_long = [passes(7), long, op(RGFX_OP_SUBMITTED, &[])].concat();
         assert_eq!(
-            deal(&last_long, 0, 0, 2),
+            deal(&last_long, 0, 0, 0, 2),
             None,
             "2 chunks at most, the first encoder's end past half the stream the last's"
         );
@@ -12365,7 +12395,8 @@ mod tests {
     }
 
     /// Where an op stream is cut into chunks dealt to two threads: at the end of each encoder that
-    /// ends the least bytes of a chunk after the last cut, into the most chunks at most, where it
+    /// ends the least bytes of a chunk after the last cut, the first chunk's for the first cut and
+    /// the later chunks' for each other, into the most chunks at most, where it
     /// holds 8 render or blit encoders and the least bytes at least; never where it holds an
     /// event's signal or wait, a compute or video encoder, a rasterization rate map's pass, an
     /// indirect command buffer's command or a residency of resources.
@@ -12375,33 +12406,48 @@ mod tests {
         let eight = passes(8);
         let at = |passes: &[usize]| Some(passes.iter().map(|n| n * pass).collect::<Vec<_>>());
         assert_eq!(
-            deal(&eight, 0, 0, 64),
+            deal(&eight, 0, 0, 0, 64),
             at(&[1, 2, 3, 4, 5, 6, 7]),
             "each encoder"
         );
         assert_eq!(
-            deal(&eight, eight.len(), 2 * pass, 64),
+            deal(&eight, eight.len(), 2 * pass, 2 * pass, 64),
             at(&[2, 4, 6]),
             "chunks of two passes"
         );
         assert_eq!(
-            deal(&eight, 0, 3 * pass, 64),
+            deal(&eight, 0, 3 * pass, 3 * pass, 64),
             at(&[3, 6]),
             "the last chunk shorter"
         );
-        assert_eq!(deal(&eight, 0, 0, 3), at(&[3, 6]), "3 chunks at most");
-        assert_eq!(deal(&eight, 0, 0, 2), at(&[4]), "2 chunks at most");
-        assert_eq!(deal(&eight, 0, 0, 1), None, "no room for a second chunk");
-        assert_eq!(deal(&eight, 0, 8 * pass, 64), None, "one chunk");
         assert_eq!(
-            deal(&eight, eight.len() + 1, 0, 64),
+            deal(&eight, 0, pass, 3 * pass, 64),
+            at(&[1, 4, 7]),
+            "a first chunk shorter than the later ones"
+        );
+        assert_eq!(
+            deal(&eight, 0, 0, 0, 4),
+            at(&[2, 4, 6]),
+            "a 4th of the stream, more than each chunk's least"
+        );
+        assert_eq!(
+            deal(&eight, 0, 4 * pass, pass, 64),
+            at(&[4, 5, 6, 7]),
+            "a first chunk longer than the later ones"
+        );
+        assert_eq!(deal(&eight, 0, 0, 0, 3), at(&[3, 6]), "3 chunks at most");
+        assert_eq!(deal(&eight, 0, 0, 0, 2), at(&[4]), "2 chunks at most");
+        assert_eq!(deal(&eight, 0, 0, 0, 1), None, "no room for a second chunk");
+        assert_eq!(deal(&eight, 0, 8 * pass, 8 * pass, 64), None, "one chunk");
+        assert_eq!(
+            deal(&eight, eight.len() + 1, 0, 0, 64),
             None,
             "under the least bytes"
         );
-        assert_eq!(deal(&passes(7), 0, 0, 64), None, "7 encoders");
+        assert_eq!(deal(&passes(7), 0, 0, 0, 64), None, "7 encoders");
         let blits = (0..8).map(|_| blit_ops()).collect::<Vec<_>>().concat();
         assert_eq!(
-            deal(&blits, 0, 4 * blit_ops().len(), 64),
+            deal(&blits, 0, 4 * blit_ops().len(), 4 * blit_ops().len(), 64),
             Some(vec![4 * blit_ops().len()]),
             "blit encoders"
         );
@@ -12411,20 +12457,24 @@ mod tests {
             op(RGFX_OP_ENCODER_END, &[]),
         ]
         .concat();
-        assert_eq!(deal(&with(compute), 0, 0, 64), None, "a compute encoder");
+        assert_eq!(deal(&with(compute), 0, 0, 0, 64), None, "a compute encoder");
         assert_eq!(
-            deal(&with(event_op(RGFX_OP_SIGNAL_EVENT, 7, 3)), 0, 0, 64),
+            deal(&with(event_op(RGFX_OP_SIGNAL_EVENT, 7, 3)), 0, 0, 0, 64),
             None,
             "a signal"
         );
         assert_eq!(
-            deal(&with(event_op(RGFX_OP_WAIT_EVENT, 7, 3)), 0, 0, 64),
+            deal(&with(event_op(RGFX_OP_WAIT_EVENT, 7, 3)), 0, 0, 0, 64),
             None,
             "a wait"
         );
         let mut short = eight.clone();
         short.truncate(eight.len() - 4);
-        assert_eq!(deal(&short, 0, 0, 64), None, "a stream that does not parse");
+        assert_eq!(
+            deal(&short, 0, 0, 0, 64),
+            None,
+            "a stream that does not parse"
+        );
     }
 
     /// The ops of the guest's whose commands keep a command buffer whole for `reason`, each with
@@ -12504,12 +12554,16 @@ mod tests {
     /// wherever it lies, and no walk of an op sends the two calls whose reasons name no op.
     #[test]
     fn deal_keeps_out_every_op_that_keeps_a_buffer_whole() {
-        assert!(deal(&passes(8), 0, 0, 64).is_some());
+        assert!(deal(&passes(8), 0, 0, 0, 64).is_some());
         for reason in KeptWhole::ALL {
             for ops in keeping_whole(reason) {
                 for before in [0, 1, 4, 8] {
                     let stream = [passes(before), ops.clone(), passes(8 - before)].concat();
-                    assert_eq!(deal(&stream, 0, 0, 64), None, "{reason:?} after {before}");
+                    assert_eq!(
+                        deal(&stream, 0, 0, 0, 64),
+                        None,
+                        "{reason:?} after {before}"
+                    );
                 }
             }
         }
@@ -12679,8 +12733,15 @@ mod tests {
         let dealt = passes(107);
         let least = dealt.len();
         let unparsed = vec![0xff; least];
-        let deal_at =
-            |ops: &[u8], min_bytes| deal(ops, min_bytes, DEAL_CHUNK_BYTES, TAKE_IN_FLIGHT_MAX);
+        let deal_at = |ops: &[u8], min_bytes| {
+            deal(
+                ops,
+                min_bytes,
+                DEAL_FIRST_CHUNK_BYTES,
+                DEAL_CHUNK_BYTES,
+                TAKE_IN_FLIGHT_MAX,
+            )
+        };
         assert!(deal_at(&dealt, least).is_some(), "read: it deals");
         assert_eq!(deal_at(&unparsed, least), None, "read: it does not parse");
         for (ops, what) in [
@@ -12708,6 +12769,7 @@ mod tests {
                 black_box(deal(
                     black_box(ops),
                     DEAL_MIN_BYTES,
+                    DEAL_FIRST_CHUNK_BYTES,
                     DEAL_CHUNK_BYTES,
                     TAKE_IN_FLIGHT_MAX,
                 ));
@@ -12715,7 +12777,13 @@ mod tests {
             start.elapsed().as_nanos() as f64 / f64::from(runs)
         };
         assert!(short.len() < DEAL_MIN_BYTES && long.len() >= DEAL_MIN_BYTES);
-        let cuts = deal(&long, DEAL_MIN_BYTES, DEAL_CHUNK_BYTES, TAKE_IN_FLIGHT_MAX);
+        let cuts = deal(
+            &long,
+            DEAL_MIN_BYTES,
+            DEAL_FIRST_CHUNK_BYTES,
+            DEAL_CHUNK_BYTES,
+            TAKE_IN_FLIGHT_MAX,
+        );
         assert!(cuts.is_some());
         let (short_ns, long_ns) = (each(&short, 1_000_000), each(&long, 1_000));
         let ops = op_bodies(&long).count();
@@ -13295,7 +13363,7 @@ mod tests {
             (393, with(&[(0, &blit[..])]), 0, "blit"),
         ];
         for (cb, ops, first, group) in cases {
-            assert!(deal(&ops, 0, 0, 64).is_some());
+            assert!(deal(&ops, 0, 0, 0, 64).is_some());
             let mark = p.call_log().mark();
             let message = command_buffer_message(cb, cb - 300, &ops);
             let fault = refusing(|| dec.decode(&device, &message)).unwrap_err();

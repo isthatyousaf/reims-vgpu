@@ -1158,8 +1158,8 @@ pub(crate) struct Shared<P: Platform> {
     /// is set ([`GraphicsDecoder::deal_min_bytes`]).
     #[cfg(test)]
     deal_min_bytes: Mutex<Option<usize>>,
-    /// The tests' own least op bytes of a chunk dealt to a thread, where one is set
-    /// ([`GraphicsDecoder::deal_chunk_bytes`]).
+    /// The tests' own least op bytes of a chunk dealt to a thread, the first's as each later
+    /// one's, where one is set ([`GraphicsDecoder::deal_chunk_bytes`]).
     #[cfg(test)]
     deal_chunk_bytes: Mutex<Option<usize>>,
     /// The walks cut and deal their buffers as though nothing their queue committed were
@@ -3721,21 +3721,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         cmdbuf::DEAL_MIN_BYTES
     }
 
-    /// Has the walks deal chunks of `bytes` of ops at least ([`Self::deal_chunk_bytes`]), or of
+    /// Has the walks deal chunks of `bytes` of ops at least, the first as each later one
+    /// ([`Self::deal_chunk_bytes`]), or of [`cmdbuf::DEAL_FIRST_CHUNK_BYTES`] and
     /// [`cmdbuf::DEAL_CHUNK_BYTES`] where `None` (for the tests).
     #[cfg(test)]
     pub(crate) fn set_deal_chunk_bytes(&self, bytes: Option<usize>) {
         *self.shared.deal_chunk_bytes.lock() = bytes;
     }
 
-    /// The least op bytes of a chunk dealt to a thread ([`cmdbuf::DEAL_CHUNK_BYTES`]; the tests
-    /// may set their own).
-    pub(crate) fn deal_chunk_bytes(&self) -> usize {
+    /// The least op bytes of the first chunk dealt to a thread and of each later one
+    /// ([`cmdbuf::DEAL_FIRST_CHUNK_BYTES`], [`cmdbuf::DEAL_CHUNK_BYTES`]; the tests may set
+    /// their own, one for both).
+    pub(crate) fn deal_chunk_bytes(&self) -> (usize, usize) {
         #[cfg(test)]
         if let Some(bytes) = *self.shared.deal_chunk_bytes.lock() {
-            return bytes;
+            return (bytes, bytes);
         }
-        cmdbuf::DEAL_CHUNK_BYTES
+        (cmdbuf::DEAL_FIRST_CHUNK_BYTES, cmdbuf::DEAL_CHUNK_BYTES)
     }
 
     /// Has the walks cut and deal their buffers as though nothing their queue committed were

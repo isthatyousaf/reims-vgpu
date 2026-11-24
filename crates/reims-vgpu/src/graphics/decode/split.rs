@@ -242,8 +242,11 @@
 //! [`DEAL_MIN_BYTES`](super::cmdbuf::DEAL_MIN_BYTES) of ops and
 //! [`DEAL_MIN_ENCODERS`](super::cmdbuf::DEAL_MIN_ENCODERS) at least, all of them render and
 //! blit encoders that hold no event, rate map, indirect command buffer or residency of
-//! resources (`cmdbuf.rs`'s `deal`), is cut at encoder ends into chunks of
-//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more (into two chunks, at the
+//! resources (`cmdbuf.rs`'s `deal`), is cut at encoder ends into a first chunk of
+//! [`DEAL_FIRST_CHUNK_BYTES`](super::cmdbuf::DEAL_FIRST_CHUNK_BYTES) of ops or more, which the
+//! GPU starts on soon, and later ones of
+//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) or more, each part costing the GPU its
+//! boundary (into two chunks, at the
 //! first encoder's end past half its ops, where its walk starts behind work its queue committed
 //! and not yet complete: "How many parts"), dealt to the lane's
 //! thread and a helper thread ([`super::helpers`]), handed over at once as the walk starts: the

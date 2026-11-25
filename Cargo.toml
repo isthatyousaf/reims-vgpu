@@ -32,13 +32,13 @@ reims-vgpu-graphics = { path = "crates/reims-vgpu-graphics" }
 # loaded at run time (`graphics::vaapi` and `graphics::nvidia` of `reims-vgpu`).
 reims-vgpu-video = { path = "crates/reims-vgpu-video" }
 # metal2vulkan's Metal types, for the Metal enums and descriptor values the runtime's calls take,
-# at the commit both name: the fork isthatyousaf/metal2vulkan's perf/a3-barriers, development's
+# at the commit both name: the fork isthatyousaf/metal2vulkan's development, upstream's
 # 0c9db49765 plus unified image layouts (VK_KHR_unified_image_layouts) for read render targets.
-metal2vulkan = { git = "https://github.com/isthatyousaf/metal2vulkan", rev = "bc1ae4932b59c632ae2844b1b265cca59efc7f86" }
+metal2vulkan = { git = "https://github.com/isthatyousaf/metal2vulkan", rev = "5c451c968df25c092c83f107d01426947c0f70d7" }
 # The Vulkan platform's runtime (architecture D1), metal2vulkan-runtime: a Metal-shaped API on
 # Vulkan, one path for every device, under reims-vgpu-vulkan's `rt_platform` and `seam` and
 # reims-vgpu's `pool::rt_blocks`.
-metal2vulkan-runtime = { git = "https://github.com/isthatyousaf/metal2vulkan", rev = "bc1ae4932b59c632ae2844b1b265cca59efc7f86" }
+metal2vulkan-runtime = { git = "https://github.com/isthatyousaf/metal2vulkan", rev = "5c451c968df25c092c83f107d01426947c0f70d7" }
 # The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
 sha2 = "0.10.9"
 # A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's
